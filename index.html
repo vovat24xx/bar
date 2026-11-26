@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#000000">
+<title>Digital Butterfly</title>
+<style>
+  :root{ --a:60,150,255; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#000;overflow:hidden;color:#e8f6ff;
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-tap-highlight-color:transparent}
+
+  #scene{position:fixed;inset:0;background:#000;isolation:isolate}
+  #scene canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #stage{touch-action:none}
+  #glow1,#glow2{pointer-events:none;mix-blend-mode:screen}
+  #glow1{filter:blur(6px) saturate(1.4) brightness(1.6)}
+  #glow2{filter:blur(20px) saturate(1.5) brightness(1.9)}
+
+  #glow1{opacity:.5}
+  #glow2{opacity:.85}
+</style>
+</head>
+<body>
+<div id="scene">
+  <canvas id="stage" role="img" aria-label="Animated glowing butterfly made of blue text characters. A digital cocoon forms first, then the butterfly emerges and flaps its wings."></canvas>
+  <canvas id="glow2" aria-hidden="true"></canvas>
+  <canvas id="glow1" aria-hidden="true"></canvas>
+</div>
+
+<noscript><p style="position:fixed;inset:0;display:grid;place-items:center;color:#9fc2e8">This animation needs JavaScript.</p></noscript>
+
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const stage = $('stage'), ctx = stage.getContext('2d', {alpha:false});
+const glow1 = $('glow1'), glow2 = $('glow2');
+const g1 = glow1.getContext('2d'), g2 = glow2.getContext('2d');
+// low-res "field" canvases: 1 pixel = 1 text cell
+const fieldA = document.createElement('canvas'), fa = fieldA.getContext('2d', {willReadFrequently:true}); // R wings, G body, B antennae
+const fieldB = document.createElement('canvas'), fb = fieldB.getContext('2d', {willReadFrequently:true}); // R cocoon
+// glyph atlases (theme colour / gold)
+const atlasT = document.createElement('canvas'), atlasG = document.createElement('canvas');
+
+const TAU = Math.PI * 2;
+const L = 16;                 // brightness levels
+const CLOSE = 1.45;           // wing angle when folded (rad)
+const FOV = 3.2;
+const T_BURST = 3.3, T_FLAP = 3.5, T_END = 4.8;   // intro timeline (s)
+
+/* ---------- themes ---------- */
+const THEMES = [
+  {name:'Blue',   rgb:'60,150,255',  stops:[[6,22,96],[24,96,255],[48,206,255],[228,249,255]]},
+  {name:'Purple', rgb:'160,100,255', stops:[[34,10,100],[124,56,255],[194,136,255],[246,234,255]]},
+  {name:'Cyan',   rgb:'40,230,230',  stops:[[0,52,74],[0,176,206],[44,255,240],[232,255,252]]},
+  {name:'Pink',   rgb:'255,90,180',  stops:[[84,8,56],[255,44,152],[255,124,204],[255,238,247]]}
+];
+const GOLD = [[70,34,0],[210,118,10],[255,184,44],[255,238,176]];
+const MODES = [
+  {name:'Subtle',   spawn:30,  flick:.45, scan:0},
+  {name:'Balanced', spawn:80,  flick:1,   scan:.6},
+  {name:'Intense',  spawn:220, flick:1.9, scan:1.2}
+];
+
+/* ---------- state ---------- */
+const st = {running:true, phase:Math.PI, speed:1, glow:1, theme:0, mode:1, vt:0, ti:0, yaw:0, pitch:0, yawT:0, pitchT:0};
+const clone = s => s.map(c => c.slice());
+const lerp = (a,b,t) => a + (b-a)*t;
+let palFrom = clone(THEMES[0].stops), palTo = clone(THEMES[0].stops), palCur = clone(THEMES[0].stops), palP = 1;
+const themeColors = new Array(L).fill('#000'), goldColors = new Array(L).fill('#000');
+const POS = [0,.38,.74,1];
+function fillColors(stops,out){
+  for(let k=0;k<L;k++){
+    const t=k/(L-1);
+    let i=0; while(i<2 && t>POS[i+1]) i++;
+    const f=(t-POS[i])/(POS[i+1]-POS[i]), a=stops[i], b=stops[i+1];
+    out[k]=`rgb(${lerp(a[0],b[0],f)|0},${lerp(a[1],b[1],f)|0},${lerp(a[2],b[2],f)|0})`;
+  }
+}
+fillColors(palCur,themeColors); fillColors(GOLD,goldColors);
+let atlasDirty = true;
+
+// field fill colours: [type*L + level]; type 0 = R (wings/cocoon), 1 = G (body), 2 = B (antennae)
+const fieldFill = [];
+for(let t=0;t<3;t++) for(let k=0;k<L;k++){
+  const v=Math.round(k/(L-1)*255);
+  fieldFill.push(t===0?`rgb(${v},0,0)`:t===1?`rgb(0,${v},0)`:`rgb(0,0,${v})`);
+}
+
+/* ---------- glyphs ---------- */
+const GL = 'becomx.:#@%01/\\|-+*=<>aXhr';
+const gi = c => GL.indexOf(c);
+const WORDI = [...'become'].map(gi);
+const DOT=gi('.'), COLON=gi(':'), BSL=gi('\\'), FSL=gi('/');
+const SPARK = [...'#@%01'].map(gi);
+const BODYC = [...'xcbaoeXh#%'].map(gi);
+const COCC  = [...'0101|/01'].map(gi);
+
+/* ---------- helpers ---------- */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function smooth(a,b,x){let t=(x-a)/(b-a);t=t<0?0:t>1?1:t;return t*t*(3-2*t)}
+function ell(u,v,cx,cy,al,a,b,tp){
+  const ca=Math.cos(al), sa=Math.sin(al), dx=u-cx, dy=v-cy;
+  const x=dx*ca+dy*sa, y=-dx*sa+dy*ca, t=x/a, pt=t>0?t:0;
+  const bb=b*(1-tp*pt*pt), yy=y/bb;
+  return {d:Math.hypot(t,yy), ang:Math.atan2(yy,t)};
+}
+function openness(p){            // 1 = open, 0 = folded; holds both ends briefly
+  const s=.5+.5*Math.cos(p);
+  let k=s*1.3-.12; k=k<0?0:k>1?1:k;
+  return k*k*(3-2*k);
+}
+
+/* ---------- geometry (wing space: u outward, v up; thorax at origin) ---------- */
+let N=0, U,V,BR,Sd,Wid,Hh,Rr,Z0,Seed, PX,PY,SZ, bk, bc=new Int32Array(3*L), edgeIdx=new Int32Array(0);
+let NC=0, CU,CV,CB,CS,CSX,CSY;
+let cellSize=0;
+
+function build(g){
+  cellSize=g;
+  const rand=mulberry32(1234);
+  const A={u:[],v:[],b:[],side:[],wid:[],h:[],z:[],seed:[],edge:[]};
+  const push=(u,v,b,side,wid,h,z,edge)=>{A.u.push(u);A.v.push(v);A.b.push(b<0?0:b>1?1:b);A.side.push(side);A.wid.push(wid);A.h.push(h);A.z.push(z);A.seed.push(rand());A.edge.push(edge)};
+
+  // wings
+  const nu=Math.ceil(1.12/g), nv=Math.ceil(2.35/g);
+  for(let iu=0;iu<nu;iu++){
+    for(let iv=0;iv<nv;iv++){
+      const u=.03+iu*g+(rand()-.5)*g*.45, v=-1.15+iv*g+(rand()-.5)*g*.45;
+      if(u<.03) continue;
+      const e1=ell(u,v,.50,.50,.82,.70,.36,.42), thr1=1+.03*Math.sin(e1.ang*10);
+      const e2=ell(u,v,.42,-.52,-.93,.58,.30,.38), thr2=1+.03*Math.sin(e2.ang*9+1);
+      const in1=e1.d<thr1, in2=e2.d<thr2;
+      if(!in1&&!in2) continue;
+      const q=Math.max(in1?1-e1.d/thr1:-1, in2?1-e2.d/thr2:-1);
+      const edge=1-smooth(0,.17,q);
+      const ring2=Math.exp(-Math.pow((q-.30)/.03,2));
+      const r=Math.hypot(u,v), a0=Math.atan2(v,u);
+
+      let b=.30+.12*(1-Math.min(1,r/1.2));
+      b+=Math.pow(.5+.5*Math.cos(a0*20+(v<0?.6:0)),6)*.30*smooth(.1,.5,r);
+      b+=Math.pow(.5+.5*Math.sin(r*14+a0*3),3)*.07;
+      b+=edge*.32+ring2*.18;
+      b+=smooth(.75,1.35,r)*.14;
+      b+=.2*Math.exp(-u*5);
+      if(edge>.3&&rand()<.07) b=1;
+      b+=(rand()-.5)*.1;
+
+      const hind=smooth(.15,-.45,v);
+      const z=.09*u*u-.02+(rand()-.5)*.006;
+      const isEdge=edge>.55?1:0;
+      push(u,v,b,1,0,hind,z,isEdge);
+      push(u,v,b+(rand()-.5)*.08,-1,0,hind,z,isEdge);
+    }
+  }
+
+  // gold body
+  const gb=g*.6;
+  for(let y=-.9;y<=.13;y+=gb){
+    let hw=0;
+    if(y>-.15){const t=(y+.01)/.14;hw=.034*Math.sqrt(Math.max(0,1-t*t));}
+    if(y<=-.1){const t=(-.1-y)/.8;hw=Math.max(hw,.028*(1-Math.pow(Math.min(1,t),1.4))+.004);}
+    if(hw<=0) continue;
+    const n=Math.max(1,Math.round(hw*2/gb));
+    for(let j=0;j<n;j++){
+      const x=-hw+(j+.5)*(2*hw/n);
+      push(x,y,.75+.15*(1-Math.abs(x)/hw)+(y<-.12?.12*Math.sin(y*70):0)+(rand()-.5)*.08,0,1,0,0,0);
+    }
+  }
+  for(let yy=.13;yy<=.21;yy+=gb) for(let xx=-.04;xx<=.04;xx+=gb){
+    if(Math.hypot(xx,yy-.17)<=.04) push(xx,yy,.9+(rand()-.5)*.06,0,1,0,0,0);
+  }
+  // antennae
+  for(const side of [-1,1]){
+    for(let t=0;t<=1;t+=.008){
+      push(side*(.02+.22*t+.12*t*t),.2+.55*t-.04*t*t,.7+.3*t,0,3,t,0,0);
+    }
+  }
+
+  N=A.u.length;
+  U=Float32Array.from(A.u); V=Float32Array.from(A.v); BR=Float32Array.from(A.b);
+  Sd=Int8Array.from(A.side); Wid=Uint8Array.from(A.wid); Hh=Float32Array.from(A.h); Z0=Float32Array.from(A.z);
+  Seed=Float32Array.from(A.seed);
+  Rr=new Float32Array(N); for(let i=0;i<N;i++) Rr[i]=Math.hypot(U[i],V[i]);
+  const ei=[]; for(let i=0;i<N;i++) if(A.edge[i]) ei.push(i);
+  edgeIdx=Int32Array.from(ei);
+  PX=new Float32Array(N); PY=new Float32Array(N); SZ=new Float32Array(N);
+  bk=Array.from({length:3*L},()=>new Int32Array(N));
+
+  // cocoon (spindle hanging on a thread)
+  const C={u:[],v:[],b:[],s:[],sx:[],sy:[]};
+  const pushC=(u,v,b)=>{
+    const a=rand()*TAU, rr=.55+rand()*1.3;
+    C.u.push(u);C.v.push(v);C.b.push(Math.max(0,Math.min(1,b)));C.s.push(rand());
+    C.sx.push(Math.cos(a)*rr*1.1);C.sy.push(Math.sin(a)*rr*.95);
+  };
+  const gc=g*1.15;
+  for(let v=-.46;v<=.46;v+=gc){
+    const t=v/.46, hw=.19*Math.sqrt(Math.max(0,1-t*t))*(1+.09*Math.sin(v*16));
+    if(hw<=0) continue;
+    const n=Math.max(1,Math.round(hw*2/gc));
+    for(let j=0;j<n;j++){
+      const x=-hw+(j+.5)*(2*hw/n), e=Math.abs(x)/hw;
+      pushC(x+(rand()-.5)*gc*.2,v,.5+.22*Math.sin(v*34+x*6)+.18*e*e+(rand()-.5)*.14);
+    }
+  }
+  for(let v=.46;v<=1.3;v+=gc*1.4) pushC(0,v,.55+(rand()-.5)*.1);
+  NC=C.u.length;
+  CU=Float32Array.from(C.u); CV=Float32Array.from(C.v); CB=Float32Array.from(C.b);
+  CS=Float32Array.from(C.s); CSX=Float32Array.from(C.sx); CSY=Float32Array.from(C.sy);
+}
+
+/* ---------- floating glyph particles ---------- */
+const MAXP=900;
+const fx=new Float32Array(MAXP), fy=new Float32Array(MAXP), fvx=new Float32Array(MAXP), fvy=new Float32Array(MAXP);
+const fl=new Float32Array(MAXP), fm=new Float32Array(MAXP), flv=new Uint8Array(MAXP), fch=new Uint8Array(MAXP);
+let fn=0, spawnAcc=0;
+
+/* ---------- layout ---------- */
+let W=0,H=0,dpr=1,S=100,cx=0,cy=0,cw=7,ch=12,fontPx=11,cols=1,rows=1,prevR=new Float32Array(1);
+function resize(){
+  W=innerWidth; H=innerHeight;
+  dpr=Math.min(window.devicePixelRatio||1, W<700?1.5:2);
+  stage.width=Math.round(W*dpr); stage.height=Math.round(H*dpr);
+  glow1.width=Math.max(2,(stage.width/3)|0); glow1.height=Math.max(2,(stage.height/3)|0);
+  glow2.width=Math.max(2,(glow1.width/3)|0); glow2.height=Math.max(2,(glow1.height/3)|0);
+  S=Math.max(Math.min(W*.46,H*.44),80)*dpr;
+  cx=stage.width/2; cy=H*.5*dpr;
+  const cwCss=Math.min(8.5,Math.max(4.4,S/dpr*.021));
+  cw=Math.max(3,Math.round(cwCss*dpr)); ch=Math.round(cw*1.8); fontPx=Math.round(cw/.6);
+  cols=Math.ceil(stage.width/cw)+1; rows=Math.ceil(stage.height/ch)+1;
+  fieldA.width=fieldB.width=cols; fieldA.height=fieldB.height=rows;
+  prevR=new Float32Array(cols*rows);
+  atlasDirty=true;
+  const g=Math.min(W,H)<640?.022:.017;
+  if(g!==cellSize) build(g);
+}
+function buildAtlas(){
+  const aw=GL.length*cw, ah=L*ch;
+  for(const [cv,colors] of [[atlasT,themeColors],[atlasG,goldColors]]){
+    cv.width=aw; cv.height=ah;
+    const a=cv.getContext('2d');
+    a.font=`700 ${fontPx}px ui-monospace,Menlo,Consolas,"Courier New",monospace`;
+    a.textAlign='center'; a.textBaseline='middle';
+    for(let k=1;k<L;k++){
+      a.fillStyle=colors[k];
+      for(let j=0;j<GL.length;j++) a.fillText(GL[j],j*cw+cw/2,k*ch+ch/2);
+    }
+  }
+  atlasDirty=false;
+}
+
+function spawnOne(){
+  if(fn>=MAXP) return;
+  let x,y;
+  if(Math.random()<.7 && edgeIdx.length){
+    const j=edgeIdx[(Math.random()*edgeIdx.length)|0]; x=PX[j]; y=PY[j];
+  }else{
+    const a=Math.random()*TAU, r=Math.sqrt(Math.random())*S*1.1;
+    x=cx+Math.cos(a)*r*1.1; y=cy+Math.sin(a)*r*.9;
+  }
+  let dx=x-cx, dy=y-cy; const d=Math.hypot(dx,dy)||1; dx/=d; dy/=d;
+  const sp=(8+Math.random()*30)*dpr;
+  fx[fn]=x; fy[fn]=y;
+  fvx[fn]=dx*sp+(Math.random()-.5)*12*dpr;
+  fvy[fn]=dy*sp*.6-(5+Math.random()*18)*dpr;
+  fm[fn]=fl[fn]=1.1+Math.random()*2.2;
+  flv[fn]=((.5+Math.random()*.5)*(L-1))|0;
+  fch[fn]=(Math.random()*GL.length)|0;
+  fn++;
+}
+
+/* ---------- main loop ---------- */
+let last=0, frameNo=0, lastStatus='', flashWas=false;
+function frame(now){
+  requestAnimationFrame(frame);
+  if(!last) last=now;
+  let dt=(now-last)/1000; last=now; if(dt>.05) dt=.05;
+  st.vt+=dt;
+  const ad=st.running?dt:0;
+  st.ti+=ad;
+  const ti=st.ti;
+  if(st.running && ti>T_FLAP) st.phase+=dt*TAU*.8*st.speed;
+  const rev=ti>=T_END?1:smooth(T_BURST,4.5,ti);
+  const rs=.3+.7*rev;
+  const cocoonOn=ti<4.5;
+  const flash=(ti>3.25&&ti<4.4)?Math.exp(-(ti-3.25)*3.2):0;
+
+  if(palP<1){
+    palP=Math.min(1,palP+dt/.7);
+    const e=palP*palP*(3-2*palP);
+    for(let i=0;i<4;i++) for(let j=0;j<3;j++) palCur[i][j]=lerp(palFrom[i][j],palTo[i][j],e);
+    fillColors(palCur,themeColors); atlasDirty=true;
+  }
+  if(atlasDirty) buildAtlas();
+
+  const kk=1-Math.exp(-dt*4);
+  st.yaw+=(st.yawT+.18*Math.sin(st.vt*.45)-st.yaw)*kk;
+  st.pitch+=(st.pitchT+.06*Math.sin(st.vt*.27+1)-st.pitch)*kk;
+  const cyw=Math.cos(st.yaw), syw=Math.sin(st.yaw), cp=Math.cos(st.pitch), sp=Math.sin(st.pitch);
+
+  const mode=MODES[st.mode], flick=mode.flick, scanAmt=mode.scan;
+  const tick=Math.floor(st.vt*8);
+  const scanV=((st.vt*.32)%1)*2.4-1.2;
+  const lvlMul=.45+.55*st.glow;
+  const cell=cellSize*S, ph0=st.phase;
+  const bob=(.035*openness(ph0)+.015*Math.sin(st.vt*.9))*rev;
+  bc.fill(0);
+
+  /* --- project butterfly particles --- */
+  if(rev>.004){
+    for(let i=0;i<N;i++){
+      const side=Sd[i], u=U[i], v=V[i], h=Hh[i];
+      let x,y=v,z=0,whit=0;
+      if(side===0){
+        x=u;
+        if(Wid[i]===3){
+          const sg=u>0?1:-1;
+          x+=sg*.014*Math.sin(st.vt*1.4+h*3)*h;
+          y+=.008*Math.sin(st.vt*1.1+h*2+u*9)*h;
+        }
+      }else{
+        const R=Rr[i];
+        const o=openness(ph0-R*(.22+.26*h));
+        const th=CLOSE*(1-o)*(1-.07*h);
+        const c=Math.cos(th), s=Math.sin(th);
+        x=side*u*c;
+        z=-u*s*.85+Z0[i]*c+.035*Math.sin(R*11-ph0*2)*(.25+s);
+        whit=smooth(.55,1.25,th);
+      }
+      x*=rs; y*=rs; z*=rs;
+      const x1=x*cyw+z*syw, z1=-x*syw+z*cyw;
+      const y1=y*cp-z1*sp+bob, z2=y*sp+z1*cp;
+      const sc=FOV/(FOV-z2);
+      const sd=Seed[i];
+      PX[i]=cx+x1*sc*S;
+      PY[i]=cy-y1*sc*S;
+      SZ[i]=cell*sc;
+
+      let lv=BR[i]*(.78+.4*z2);
+      lv*=.88+.12*Math.sin(st.vt*3.1+sd*TAU*3);
+      lv+=whit*.3;
+      let hs=Math.sin(i*12.9898+tick*78.233)*43758.5453; hs-=Math.floor(hs);
+      if(hs<.01*flick) lv*=.4;
+      if(scanAmt>0){const dd=v-scanV; if(dd<.12&&dd>-.12) lv+=Math.exp(-dd*dd/.0016)*.45*scanAmt;}
+      lv=(lv+flash*.25)*lvlMul*rev;
+      let k=(lv*(L-1)+.5)|0; if(k<=0) continue; if(k>=L) k=L-1;
+      const t=side===0?(Wid[i]===3?2:1):0;
+      const b=t*L+k;
+      bk[b][bc[b]++]=i;
+    }
+  }
+
+  /* --- draw butterfly into field A (1 px = 1 text cell, "lighten" = max) --- */
+  fa.globalCompositeOperation='source-over';
+  fa.fillStyle='#000'; fa.fillRect(0,0,cols,rows);
+  fa.globalCompositeOperation='lighten';
+  for(let b=1;b<3*L;b++){
+    const n=bc[b]; if(!n) continue;
+    fa.fillStyle=fieldFill[b];
+    const arr=bk[b];
+    for(let m=0;m<n;m++){
+      const j=arr[m], w=SZ[j]*1.5/cw, hh=SZ[j]*1.5/ch;
+      fa.fillRect(PX[j]/cw-w*.5,PY[j]/ch-hh*.5,w,hh);
+    }
+  }
+
+  /* --- cocoon into field B --- */
+  if(cocoonOn){
+    fb.globalCompositeOperation='source-over';
+    fb.fillStyle='#000'; fb.fillRect(0,0,cols,rows);
+    fb.globalCompositeOperation='lighten';
+    const pulseAmt=smooth(2.4,3.2,ti);
+    const pulse=1+.035*Math.sin(ti*10)*pulseAmt+(ti>T_BURST?(ti-T_BURST)*1.1:0);
+    const fade=ti>T_BURST?Math.max(0,1-(ti-T_BURST)/.9):1;
+    const crack=smooth(2.2,3.2,ti);
+    if(fade>0){
+      for(let i=0;i<NC;i++){
+        const sd=CS[i];
+        let a=(ti-sd*.9)/1.3; a=a<0?0:a>1?1:a;
+        const e=1-Math.pow(1-a,3);
+        let x=lerp(CSX[i],CU[i],e), y=lerp(CSY[i],CV[i],e);
+        const ang=(1-e)*2.2, ca=Math.cos(ang), sa=Math.sin(ang);
+        const xr=x*ca-y*sa, yr=x*sa+y*ca;
+        x=xr*pulse; y=yr*pulse;
+        const x1=x*cyw, z1=-x*syw;
+        const y1=y*cp-z1*sp, z2=y*sp+z1*cp;
+        const sc=FOV/(FOV-z2);
+        let lv=CB[i]*(.35+.65*e)*(.88+.22*Math.sin(ti*10+sd*6));
+        if(crack>0 && Math.sin(CU[i]*40+CV[i]*9)>.9) lv+=.6*crack;
+        lv=(lv+flash*.3)*lvlMul*fade;
+        let k=(lv*(L-1)+.5)|0; if(k<=0) continue; if(k>=L) k=L-1;
+        const w=cell*1.15*sc*1.5/cw, hh=cell*1.15*sc*1.5/ch;
+        fb.fillStyle=fieldFill[k];
+        fb.fillRect((cx+x1*sc*S)/cw-w*.5,(cy-y1*sc*S)/ch-hh*.5,w,hh);
+      }
+    }
+  }
+
+  /* --- field -> glyphs --- */
+  const dA=fa.getImageData(0,0,cols,rows).data;
+  const dB=cocoonOn?fb.getImageData(0,0,cols,rows).data:null;
+  ctx.globalCompositeOperation='source-over';
+  ctx.globalAlpha=1;
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,stage.width,stage.height);
+  const midCol=cx/cw;
+  let lit=0;
+  for(let r=0;r<rows;r++){
+    const ry=r*ch;
+    let antL=-1, antR=-1;
+    for(let c=0;c<cols;c++){
+      const p=r*cols+c, i=p<<2;
+      const Rv=dA[i], Gv=dA[i+1], Bq=dA[i+2];
+      const pv=prevR[p]*.62;
+      const wv=Rv>pv?Rv:pv;
+      prevR[p]=wv;
+      const Cv=dB?dB[i]:0;
+      let kind,lv;
+      if(Gv>26){kind=1;lv=Gv}
+      else if(Bq>26){kind=2;lv=Bq}
+      else if(Cv>wv){kind=4;lv=Cv}
+      else{kind=3;lv=wv}
+      if(lv<22) continue;
+      let k=((lv/255)*(L-1)+.5)|0; if(k<1) continue; if(k>=L) k=L-1;
+
+      let h0=((c*73856093)^(r*19349663))>>>0; h0=Math.imul(h0^(h0>>>15),2246822519)>>>0;
+      let h=(h0^Math.imul(tick,83492791))>>>0; h=Math.imul(h^(h>>>13),3266489917)>>>0;
+      const hv=(h&1023)/1023;
+      let j;
+      if(kind===3){
+        if(k<=3) j=(h0&1)?DOT:COLON;
+        else{
+          j=WORDI[((c-2*r)%6+6)%6];
+          if(hv<.018*flick) j=(h>>>10)%GL.length;
+          else if(k>=L-3 && hv>.93) j=SPARK[(h>>>8)%SPARK.length];
+        }
+      }else if(kind===1){
+        j=BODYC[(h0>>>5)%BODYC.length];
+      }else if(kind===2){
+        if(r&1) continue;
+        if(c<midCol){ if(antL>=0) continue; antL=c; j=BSL; }
+        else{ if(antR>=0) continue; antR=c; j=FSL; }
+      }else{
+        j=COCC[(h>>>6)%COCC.length];
+      }
+      ctx.drawImage((kind===1||kind===2)?atlasG:atlasT,j*cw,k*ch,cw,ch,c*cw,ry,cw,ch);
+      lit++;
+    }
+  }
+
+  /* --- floating glyphs --- */
+  if(ad>0 && rev>.5){
+    spawnAcc+=mode.spawn*ad;
+    while(spawnAcc>=1){spawnOne();spawnAcc--;}
+  }
+  if(ad>0){
+    for(let i=0;i<fn;i++){
+      fl[i]-=ad;
+      if(fl[i]<=0){
+        fn--; fx[i]=fx[fn];fy[i]=fy[fn];fvx[i]=fvx[fn];fvy[i]=fvy[fn];fl[i]=fl[fn];fm[i]=fm[fn];flv[i]=flv[fn];fch[i]=fch[fn];
+        i--; continue;
+      }
+      fvx[i]+=(Math.random()-.5)*36*dpr*ad;
+      fvy[i]+=(Math.random()-.5)*26*dpr*ad-4*dpr*ad;
+      fx[i]+=fvx[i]*ad; fy[i]+=fvy[i]*ad;
+    }
+  }
+  for(let i=0;i<fn;i++){
+    const t=fl[i]/fm[i];
+    ctx.globalAlpha=Math.min(1,t*2.2)*(.65+.35*Math.sin(st.vt*9+i));
+    ctx.drawImage(atlasT,fch[i]*cw,flv[i]*ch,cw,ch,fx[i]-cw*.35,fy[i]-ch*.35,cw*.7,ch*.7);
+  }
+  ctx.globalAlpha=1;
+
+  /* --- bloom --- */
+  g1.globalCompositeOperation='copy'; g1.drawImage(stage,0,0,glow1.width,glow1.height);
+  g2.globalCompositeOperation='copy'; g2.drawImage(glow1,0,0,glow2.width,glow2.height);
+  if(flash>.01||flashWas){
+    glow1.style.opacity=Math.min(1,.5*st.glow+flash*.5);
+    glow2.style.opacity=Math.min(1,.85*st.glow+flash*.6);
+    flashWas=flash>.01;
+  }
+
+}
+
+window.addEventListener('pointermove',e=>{
+  st.yawT=(e.clientX/innerWidth-.5)*2*.42;
+  st.pitchT=(e.clientY/innerHeight-.5)*2*.22;
+},{passive:true});
+document.documentElement.addEventListener('pointerleave',()=>{st.yawT=0;st.pitchT=0});
+window.addEventListener('resize',resize);
+
+resize();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
